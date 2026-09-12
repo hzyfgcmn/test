@@ -2,6 +2,7 @@
 import base64
 import re
 import cv2
+import fitz  # PyMuPDF (kurulum: pip install PyMuPDF)
 import numpy as np
 from pathlib import Path
 from email import policy
@@ -13,6 +14,11 @@ import pytesseract
 # ============================================================================
 # ÖNEMLİ AYARLAR
 pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+
+# Filigran temizleme esikleri (filigran kalirsa dusur, metin bozulursa yukselt)
+FILIGRAN_PARLAKLIK_ESIGI = 105   # Bu gri seviyenin ustundeki pikseller beyaza cekilir
+FILIGRAN_HSV_V_ESIGI = 110       # HSV parlaklik (V) esigi: acik tonlu filigran
+FILIGRAN_HSV_S_ESIGI = 90        # HSV doygunluk (S) esigi: renkli ama soluk filigran
 # ============================================================================
 
 
@@ -21,12 +27,43 @@ def dosya_sec() -> Path | None:
     kok.withdraw()
     kok.attributes("-topmost", True)
     yol = filedialog.askopenfilename(
-        title="MHTML veya HTML dosyasini secin",
+        title="PDF, MHTML veya HTML dosyasini secin",
         initialdir=str(Path.home() / "Desktop"),
-        filetypes=[("Web kayitlari", "*.mhtml *.mht *.html *.htm"), ("Tum dosyalar", "*.*")],
+        filetypes=[
+            ("PDF dosyalari", "*.pdf"),
+            ("Web kayitlari", "*.mhtml *.mht *.html *.htm"),
+            ("Tum dosyalar", "*.*"),
+        ],
     )
     kok.destroy()
     return Path(yol) if yol else None
+
+
+def pdf_sayfalarini_cikar(yol: Path) -> list[bytes]:
+    """PDF sayfalarini yuksek cozunurlukte render edip PNG byte'lari olarak dondurur."""
+    sayfa_goruntuleri: list[bytes] = []
+    with fitz.open(yol) as belge:
+        for sayfa in belge:
+            pix = sayfa.get_pixmap(matrix=fitz.Matrix(3, 3))
+            sayfa_goruntuleri.append(pix.tobytes("png"))
+    return sayfa_goruntuleri
+
+
+def filigrani_sil(img):
+    """Acik tonlu / soluk renkli filigran piksellerini beyaza boyar, koyu metni korur."""
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    s, v = hsv[:, :, 1], hsv[:, :, 2]
+
+    # Yuksek parlaklik + dusuk/orta doygunluk: tipik ÖSYM filigrani
+    filigran_maskesi = (v > FILIGRAN_HSV_V_ESIGI) & (s < FILIGRAN_HSV_S_ESIGI)
+
+    # Gri tonlamada da acik pikselleri beyaza cek (capraz tekrarli desen kalintilari)
+    gri = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    filigran_maskesi |= gri > FILIGRAN_PARLAKLIK_ESIGI
+
+    img = img.copy()
+    img[filigran_maskesi] = 255
+    return img
 
 
 def goruntuyu_temizle_ve_netlestir(resim_verisi: bytes):
@@ -44,7 +81,8 @@ def goruntuyu_temizle_ve_netlestir(resim_verisi: bytes):
         # 1) Çözünürlüğü artır (Lanczos, cubic'ten daha net sonuç verir)
         img = cv2.resize(img, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_LANCZOS4)
 
-        # 2) Gri tonlama
+        # 2) Filigrani sil ve gri tonlamaya gec
+        img = filigrani_sil(img)
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
         # 3) Gürültü azaltma (filigran kalıntılarını ve JPEG artefaktlarını temizler)
@@ -105,12 +143,19 @@ def sayfa_numarasi_bul(img: Image.Image) -> int:
 
 
 def sayfalari_cikar_ve_isle(yol: Path):
-    ham = yol.read_bytes()
-    mesaj = BytesParser(policy=policy.default).parsebytes(ham)
-
     islenmis_sayfalar = []
 
-    print("Dosya taranıyor, cozunurluk artiriliyor ve yazilar netlestiriliyor...")
+    print("Dosya taranıyor, filigran siliniyor ve yazilar netlestiriliyor...")
+
+    if yol.suffix.lower() == ".pdf":
+        for veri in pdf_sayfalarini_cikar(yol):
+            temiz = goruntuyu_temizle_ve_netlestir(veri)
+            if temiz:
+                islenmis_sayfalar.append(temiz)
+        return islenmis_sayfalar
+
+    ham = yol.read_bytes()
+    mesaj = BytesParser(policy=policy.default).parsebytes(ham)
 
     parcalar = mesaj.walk() if mesaj.is_multipart() else [mesaj]
     for parca in parcalar:
@@ -142,7 +187,7 @@ def sayfalari_cikar_ve_isle(yol: Path):
 
 
 def main() -> None:
-    print("MHTML/HTML dosyasini secin...")
+    print("PDF, MHTML veya HTML dosyasini secin...")
     kaynak = dosya_sec()
     if not kaynak:
         print("Dosya secilmedi.")
@@ -155,22 +200,29 @@ def main() -> None:
         print("\nUyari: Islenecek gecerli bir sayfa bulunamadi.")
         return
 
-    print(f"\nToplam {len(sayfalar)} sayfa islendi. Sayfa numaralari tespit edilip BUYUKTEN KUCUGE siralanmaya basliyor...")
+    pdf_girdisi = kaynak.suffix.lower() == ".pdf"
 
-    sirali_liste = []
-    for sayac, img in enumerate(sayfalar, 1):
-        numara = sayfa_numarasi_bul(img)
-        sirali_liste.append({
-            "numara": numara,
-            "resim": img
-        })
-        okunan = "Bulunamadi (Sona eklenecek)" if numara == -1 else numara
-        print(f"  Analiz edilen sayfa {sayac}... Algilanan No: {okunan}")
+    if pdf_girdisi:
+        # PDF sayfalari zaten sirali geldigi icin orijinal sira korunur
+        print(f"\nToplam {len(sayfalar)} sayfa islendi. PDF girdisi oldugu icin orijinal sayfa sirasi korunuyor...")
+        son_sayfalar = sayfalar
+    else:
+        print(f"\nToplam {len(sayfalar)} sayfa islendi. Sayfa numaralari tespit edilip BUYUKTEN KUCUGE siralanmaya basliyor...")
 
-    # Büyükten küçüğe sıralama
-    sirali_liste.sort(key=lambda x: x["numara"], reverse=True)
+        sirali_liste = []
+        for sayac, img in enumerate(sayfalar, 1):
+            numara = sayfa_numarasi_bul(img)
+            sirali_liste.append({
+                "numara": numara,
+                "resim": img
+            })
+            okunan = "Bulunamadi (Sona eklenecek)" if numara == -1 else numara
+            print(f"  Analiz edilen sayfa {sayac}... Algilanan No: {okunan}")
 
-    son_sayfalar = [eleman["resim"] for eleman in sirali_liste]
+        # Büyükten küçüğe sıralama
+        sirali_liste.sort(key=lambda x: x["numara"], reverse=True)
+
+        son_sayfalar = [eleman["resim"] for eleman in sirali_liste]
 
     hedef_pdf = Path.home() / "Downloads" / f"Net_Sirali_{kaynak.stem}.pdf"
     print(f"\nPDF olusturuluyor: {hedef_pdf.name}")
@@ -184,7 +236,10 @@ def main() -> None:
         append_images=son_sayfalar[1:]
     )
 
-    print("\n✅ Islem tamamlandi. Netlestirilmis ve BUYUKTEN KUCUGE sirali PDF 'Downloads' klasorune kaydedildi.")
+    if pdf_girdisi:
+        print("\n✅ Islem tamamlandi. Filigrani temizlenmis PDF 'Downloads' klasorune kaydedildi.")
+    else:
+        print("\n✅ Islem tamamlandi. Netlestirilmis ve BUYUKTEN KUCUGE sirali PDF 'Downloads' klasorune kaydedildi.")
 
 
 if __name__ == "__main__":
